@@ -24,6 +24,7 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -120,35 +121,6 @@ func (c *ConnectionState) Describe() string {
 // connState is the single global connection status tracker for this process.
 var connState = NewConnectionState()
 
-// historySyncMu / lastHistorySyncRequest debounce automatic history-sync
-// requests so a flapping connection doesn't spam WhatsApp with requests.
-var (
-	historySyncMu          sync.Mutex
-	lastHistorySyncRequest time.Time
-)
-
-// triggerHistorySync asks WhatsApp for recent chat history, but only if we
-// haven't already asked within the last minute. This is called whenever the
-// bridge (re)connects so that messages sent/received while it was offline
-// get backfilled instead of silently missing from the local database.
-func triggerHistorySync(client *whatsmeow.Client, logger waLog.Logger) {
-	historySyncMu.Lock()
-	if time.Since(lastHistorySyncRequest) < time.Minute {
-		historySyncMu.Unlock()
-		return
-	}
-	lastHistorySyncRequest = time.Now()
-	historySyncMu.Unlock()
-
-	// Give the connection a moment to fully stabilize before requesting sync.
-	time.Sleep(2 * time.Second)
-	if !client.IsConnected() {
-		return
-	}
-	logger.Infof("Requesting history sync to backfill any messages missed while disconnected...")
-	requestHistorySync(client)
-}
-
 // watchReconnection is a safety-net goroutine on top of whatsmeow's built-in
 // auto-reconnect. whatsmeow already retries transient disconnects with
 // backoff, but this watchdog periodically double-checks the socket and
@@ -238,6 +210,35 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 		jid, name, lastMessageTime,
 	)
 	return err
+}
+
+// UpsertContactName records a name for a JID discovered via the contact
+// directory (as opposed to via an actual chat/message). Unlike StoreChat,
+// this never clobbers a name that already came from real chat activity -
+// it only fills in a row that doesn't exist yet, or replaces a placeholder
+// name (empty, or just the bare phone number) with a real one.
+func (store *MessageStore) UpsertContactName(jid, name string) (changed bool, wasNew bool, err error) {
+	var existing string
+	err = store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", jid).Scan(&existing)
+	if err == sql.ErrNoRows {
+		_, err = store.db.Exec(
+			"INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, NULL)", jid, name,
+		)
+		return err == nil, true, err
+	}
+	if err != nil {
+		return false, false, err
+	}
+
+	userPart := jid
+	if idx := strings.Index(jid, "@"); idx >= 0 {
+		userPart = jid[:idx]
+	}
+	if existing == "" || existing == userPart {
+		_, err = store.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, jid)
+		return err == nil, false, err
+	}
+	return false, false, nil
 }
 
 // Store a message in the database
@@ -843,8 +844,18 @@ type StatusResponse struct {
 	Description   string `json:"description"`              // human/AI-readable summary and recommended action
 }
 
+// RefreshContactsResponse represents the response for the contact-directory refresh API.
+type RefreshContactsResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Added   int    `json:"added"`
+	Updated int    `json:"updated"`
+	Total   int    `json:"total"`
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	logger := waLog.Stdout("API", "INFO", true)
 	// Handler for checking bridge/connection status
 	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -866,6 +877,82 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for refreshing the local contact directory from WhatsApp's
+	// synced contact/address-book state. This is distinct from chat history:
+	// search_contacts only sees people you've already exchanged messages
+	// with, since it reads the `chats` table. This pulls in everyone in the
+	// account's synced contact list, so a contact can be found and messaged
+	// even before any chat with them exists locally.
+	http.HandleFunc("/api/contacts/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(RefreshContactsResponse{
+				Success: false,
+				Message: connState.Describe(),
+			})
+			return
+		}
+
+		// Ask the server for the latest contact app-state patches. Not fatal
+		// if this fails - we fall back to whatever is already cached locally.
+		if err := client.FetchAppState(context.Background(), appstate.WAPatchCriticalUnblockLow, false, false); err != nil {
+			logger.Warnf("Failed to fetch latest contact app state (using cached data instead): %v", err)
+		}
+
+		contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(RefreshContactsResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to read local contact store: %v", err),
+			})
+			return
+		}
+
+		added, updated := 0, 0
+		for jid, info := range contacts {
+			name := info.FullName
+			if name == "" {
+				name = info.PushName
+			}
+			if name == "" {
+				name = info.BusinessName
+			}
+			if name == "" {
+				continue
+			}
+			changed, wasNew, err := messageStore.UpsertContactName(jid.String(), name)
+			if err != nil {
+				logger.Warnf("Failed to store contact %s: %v", jid, err)
+				continue
+			}
+			if changed {
+				if wasNew {
+					added++
+				} else {
+					updated++
+				}
+			}
+		}
+
+		json.NewEncoder(w).Encode(RefreshContactsResponse{
+			Success: true,
+			Message: fmt.Sprintf(
+				"Synced contact directory: %d new contact(s) added, %d existing name(s) filled in, %d total known contacts.",
+				added, updated, len(contacts),
+			),
+			Added:   added,
+			Updated: updated,
+			Total:   len(contacts),
+		})
 	})
 
 	// Handler for sending messages
@@ -897,7 +984,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, waLog.Stdout("API", "INFO", true), req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, logger, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1039,8 +1126,10 @@ func main() {
 		case *events.Connected:
 			connState.Set(StatusConnected, "")
 			logger.Infof("Connected to WhatsApp")
-			// Backfill anything we missed while disconnected.
-			go triggerHistorySync(client, logger)
+			// No explicit backfill call needed here: WhatsApp queues messages
+			// sent to an offline device and delivers them as normal
+			// events.Message once the socket reconnects, so they're picked
+			// up automatically by handleMessage above.
 
 		case *events.Disconnected:
 			connState.Set(StatusReconnecting, "websocket disconnected")
@@ -1382,42 +1471,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
-}
-
-// Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
-	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
-		return
-	}
-
-	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
-		return
-	}
-
-	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
-		return
-	}
-
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
-	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
-	}
-
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
-	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
-	}
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file

@@ -15,7 +15,8 @@ from whatsapp import (
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media,
-    get_connection_status as whatsapp_get_connection_status
+    get_connection_status as whatsapp_get_connection_status,
+    refresh_contacts as whatsapp_refresh_contacts
 )
 
 # Initialize FastMCP server
@@ -148,6 +149,43 @@ def get_connection_status() -> Dict[str, Any]:
 
 
 @mcp.tool()
+def refresh_contacts() -> Dict[str, Any]:
+    """Force a fresh sync of WhatsApp's contact/address-book directory into the local database.
+
+    Call this when search_contacts comes up empty for someone you'd expect to be a contact.
+    search_contacts only sees people you've already exchanged messages with (it reads chat
+    history); this pulls in WhatsApp's full synced contact list, including people you have no
+    chat history with yet, so they become findable afterward. Requires the bridge to be
+    connected - if it isn't, call get_connection_status() first.
+
+    Returns a "state" ("ok" or "error"), a "message" summarizing how many contacts were
+    added/updated, and a "next_steps" menu.
+    """
+    result = whatsapp_refresh_contacts()
+    success = result.get("success", False)
+    message = result.get("message", "")
+    if success:
+        return {
+            "state": "ok",
+            "message": message,
+            "added": result.get("added", 0),
+            "updated": result.get("updated", 0),
+            "total": result.get("total", 0),
+            "next_steps": _menu(
+                'search_contacts(query="...") — try the lookup again now that the directory is synced.'
+            )
+        }
+    return {
+        "state": "error",
+        "message": message,
+        "next_steps": _menu(
+            "get_connection_status() — see the bridge's exact state and recommended fix before "
+            "retrying this sync."
+        )
+    }
+
+
+@mcp.tool()
 def search_contacts(query: str) -> Dict[str, Any]:
     """Search WhatsApp contacts by name or phone number.
 
@@ -176,11 +214,11 @@ def search_contacts(query: str) -> Dict[str, Any]:
         "message": f'No contacts matched "{query}".',
         "contacts": [],
         "next_steps": _menu(
+            "refresh_contacts() — this only searches people you've already chatted with; sync "
+            "WhatsApp's full contact directory if you expect this person to be a known contact.",
             'search_contacts(query="...") — retry with a shorter/partial name, or just the digits '
             "of a phone number.",
-            'list_chats(query="...") — search existing chats directly instead of the contact list.',
-            "get_connection_status() — check the bridge has actually synced contacts if you expected "
-            "a match."
+            'list_chats(query="...") — search existing chats directly instead of the contact list.'
         )
     }
 
