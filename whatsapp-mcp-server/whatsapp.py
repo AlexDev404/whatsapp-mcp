@@ -622,29 +622,72 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
+def get_connection_status() -> dict:
+    """Check whether the WhatsApp bridge process is running and connected to WhatsApp.
+
+    Call this whenever a send/list call fails or behaves unexpectedly, instead of
+    guessing - it returns a plain-English description of what's going on (e.g.
+    "reconnecting", "logged out, needs QR re-scan") and what to do about it.
+    """
+    try:
+        response = requests.get(f"{WHATSAPP_API_BASE_URL}/status", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+        return {
+            "status": "error",
+            "connected": False,
+            "description": f"Bridge returned HTTP {response.status_code}: {response.text}",
+        }
+    except requests.exceptions.ConnectionError:
+        return {
+            "status": "unreachable",
+            "connected": False,
+            "description": (
+                "Could not reach the WhatsApp bridge process on localhost:8080. "
+                "It is likely not running - start it with `go run main.go` in the "
+                "whatsapp-bridge/ directory."
+            ),
+        }
+    except requests.RequestException as e:
+        return {
+            "status": "unreachable",
+            "connected": False,
+            "description": f"Request to the WhatsApp bridge failed: {str(e)}",
+        }
+
+
+def _describe_connection_error(e: Exception) -> str:
+    """Turn a low-level connection error into an actionable message, using the
+    bridge's own status endpoint when possible instead of a bare stack trace."""
+    if isinstance(e, requests.exceptions.ConnectionError):
+        status = get_connection_status()
+        return status.get("description", str(e))
+    return f"Request error: {str(e)}"
+
+
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
-        
+
         response = requests.post(url, json=payload)
-        
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
+        return False, _describe_connection_error(e)
     except json.JSONDecodeError:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
@@ -678,7 +721,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
             
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
+        return False, _describe_connection_error(e)
     except json.JSONDecodeError:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
@@ -718,7 +761,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
             
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
+        return False, _describe_connection_error(e)
     except json.JSONDecodeError:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:

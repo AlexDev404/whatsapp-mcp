@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +40,138 @@ type Message struct {
 	IsFromMe  bool
 	MediaType string
 	Filename  string
+}
+
+// Connection status values exposed over the REST API and used to decide
+// whether the bridge is safe to auto-reconnect or needs human intervention
+// (e.g. a QR re-scan). These are deliberately plain strings rather than an
+// enum so they can be serialized as-is and read directly by an LLM/agent
+// without needing to consult the source code.
+const (
+	StatusConnecting   = "connecting"
+	StatusConnected    = "connected"
+	StatusReconnecting = "reconnecting"
+	StatusLoggedOut    = "logged_out"
+	StatusBanned       = "banned"
+)
+
+// ConnectionState tracks the live status of the WhatsApp connection so that
+// REST handlers (and therefore the MCP server / AI caller) can report clear,
+// actionable status instead of a bare "not connected" error.
+type ConnectionState struct {
+	mu            sync.RWMutex
+	status        string
+	lastError     string
+	lastConnected time.Time
+	lastChanged   time.Time
+}
+
+func NewConnectionState() *ConnectionState {
+	return &ConnectionState{status: StatusConnecting, lastChanged: time.Now()}
+}
+
+func (c *ConnectionState) Set(status, errMsg string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if status == StatusConnected {
+		c.lastConnected = time.Now()
+	}
+	c.status = status
+	c.lastError = errMsg
+	c.lastChanged = time.Now()
+}
+
+// Snapshot returns the current status, the last error message (if any), and
+// the timestamp the bridge was last known to be fully connected.
+func (c *ConnectionState) Snapshot() (status, lastError string, lastConnected, lastChanged time.Time) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.status, c.lastError, c.lastConnected, c.lastChanged
+}
+
+// Describe returns a human/AI-readable sentence describing the current
+// connection status and what (if anything) should be done about it.
+func (c *ConnectionState) Describe() string {
+	status, lastError, _, _ := c.Snapshot()
+	switch status {
+	case StatusConnected:
+		return "Connected to WhatsApp."
+	case StatusConnecting:
+		return "Bridge is starting up and connecting to WhatsApp for the first time."
+	case StatusReconnecting:
+		msg := "Bridge is disconnected from WhatsApp and automatically retrying the connection in the background. Wait a few seconds and try again."
+		if lastError != "" {
+			msg += fmt.Sprintf(" Last error: %s.", lastError)
+		}
+		return msg
+	case StatusLoggedOut:
+		msg := "WhatsApp session was logged out / unpaired and will not reconnect automatically."
+		if lastError != "" {
+			msg += fmt.Sprintf(" Reason: %s.", lastError)
+		}
+		return msg + " Restart the bridge and scan the QR code with WhatsApp on your phone to relink."
+	case StatusBanned:
+		return fmt.Sprintf("WhatsApp has temporarily banned this account: %s. Wait for the ban to expire before retrying.", lastError)
+	default:
+		return fmt.Sprintf("Unknown connection status: %s", status)
+	}
+}
+
+// connState is the single global connection status tracker for this process.
+var connState = NewConnectionState()
+
+// historySyncMu / lastHistorySyncRequest debounce automatic history-sync
+// requests so a flapping connection doesn't spam WhatsApp with requests.
+var (
+	historySyncMu          sync.Mutex
+	lastHistorySyncRequest time.Time
+)
+
+// triggerHistorySync asks WhatsApp for recent chat history, but only if we
+// haven't already asked within the last minute. This is called whenever the
+// bridge (re)connects so that messages sent/received while it was offline
+// get backfilled instead of silently missing from the local database.
+func triggerHistorySync(client *whatsmeow.Client, logger waLog.Logger) {
+	historySyncMu.Lock()
+	if time.Since(lastHistorySyncRequest) < time.Minute {
+		historySyncMu.Unlock()
+		return
+	}
+	lastHistorySyncRequest = time.Now()
+	historySyncMu.Unlock()
+
+	// Give the connection a moment to fully stabilize before requesting sync.
+	time.Sleep(2 * time.Second)
+	if !client.IsConnected() {
+		return
+	}
+	logger.Infof("Requesting history sync to backfill any messages missed while disconnected...")
+	requestHistorySync(client)
+}
+
+// watchReconnection is a safety-net goroutine on top of whatsmeow's built-in
+// auto-reconnect. whatsmeow already retries transient disconnects with
+// backoff, but this watchdog periodically double-checks the socket and
+// nudges Connect() again if it's ever found dead and not logged out, so the
+// bridge recovers even if the built-in retry loop gets stuck or disabled.
+func watchReconnection(client *whatsmeow.Client, logger waLog.Logger) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		status, _, _, _ := connState.Snapshot()
+		if status == StatusLoggedOut || status == StatusBanned {
+			// Needs human intervention (re-scan QR, or wait out a ban) - don't hammer it.
+			continue
+		}
+		if client.IsConnected() {
+			continue
+		}
+		logger.Infof("Watchdog: connection is down (status: %s), attempting to reconnect...", status)
+		if err := client.Connect(); err != nil && !strings.Contains(err.Error(), "already connected") {
+			logger.Warnf("Watchdog reconnect attempt failed: %v", err)
+			connState.Set(StatusReconnecting, err.Error())
+		}
+	}
 }
 
 // Database handler for storing message history
@@ -203,9 +336,9 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, connState.Describe()
 	}
 
 	// Create JID for recipient
@@ -362,10 +495,32 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// Store the outgoing message immediately, rather than waiting for the
+	// server to echo it back as an events.Message. Without this, a message
+	// sent while briefly disconnected/reconnecting (or if the echo is ever
+	// dropped) would silently be missing from list_messages/get_chat until
+	// some later event happened to store it.
+	chatJIDStr := recipientJID.String()
+	selfUser := ""
+	if client.Store.ID != nil {
+		selfUser = client.Store.ID.User
+	}
+	name := GetChatName(client, messageStore, recipientJID, chatJIDStr, nil, "", logger)
+	if err := messageStore.StoreChat(chatJIDStr, name, resp.Timestamp); err != nil {
+		logger.Warnf("Failed to update chat after send: %v", err)
+	}
+	mediaType, filename, mediaURL, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	if err := messageStore.StoreMessage(
+		string(resp.ID), chatJIDStr, selfUser, message, resp.Timestamp, true,
+		mediaType, filename, mediaURL, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+	); err != nil {
+		logger.Warnf("Failed to store outgoing message: %v", err)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -675,8 +830,44 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// StatusResponse represents the response for the connection status API.
+// This is the primary way for an MCP server / AI caller to understand the
+// bridge's health without reading the Go source: `description` is a plain
+// English sentence describing what's going on and what (if anything) to do.
+type StatusResponse struct {
+	Status        string `json:"status"`    // "connecting" | "connected" | "reconnecting" | "logged_out" | "banned"
+	Connected     bool   `json:"connected"` // true if the websocket is currently up
+	LoggedIn      bool   `json:"logged_in"` // true if the session is authenticated
+	LastError     string `json:"last_error,omitempty"`
+	LastConnected string `json:"last_connected,omitempty"` // RFC3339, empty if never connected
+	Description   string `json:"description"`              // human/AI-readable summary and recommended action
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Handler for checking bridge/connection status
+	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		status, lastError, lastConnected, _ := connState.Snapshot()
+		resp := StatusResponse{
+			Status:      status,
+			Connected:   client.IsConnected(),
+			LoggedIn:    client.IsLoggedIn(),
+			LastError:   lastError,
+			Description: connState.Describe(),
+		}
+		if !lastConnected.IsZero() {
+			resp.LastConnected = lastConnected.Format(time.RFC3339)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -706,7 +897,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, waLog.Stdout("API", "INFO", true), req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -846,10 +1037,48 @@ func main() {
 			handleHistorySync(client, messageStore, v, logger)
 
 		case *events.Connected:
+			connState.Set(StatusConnected, "")
 			logger.Infof("Connected to WhatsApp")
+			// Backfill anything we missed while disconnected.
+			go triggerHistorySync(client, logger)
+
+		case *events.Disconnected:
+			connState.Set(StatusReconnecting, "websocket disconnected")
+			logger.Warnf("Disconnected from WhatsApp, whatsmeow will attempt to reconnect automatically")
+
+		case *events.KeepAliveTimeout:
+			logger.Warnf("Keepalive ping timed out (%d consecutive failures), connection may be stale", v.ErrorCount)
+
+		case *events.KeepAliveRestored:
+			logger.Infof("Keepalive pings restored")
+
+		case *events.StreamReplaced:
+			connState.Set(StatusLoggedOut, "session replaced by another connection using the same credentials")
+			logger.Warnf("Stream replaced - another process connected with the same session. This bridge will not reconnect automatically.")
+
+		case *events.ConnectFailure:
+			if v.Reason.IsLoggedOut() {
+				connState.Set(StatusLoggedOut, v.Reason.String())
+			} else {
+				connState.Set(StatusReconnecting, v.Reason.String())
+			}
+			logger.Warnf("Connect failure: %s", v.Reason.String())
+
+		case *events.ClientOutdated:
+			connState.Set(StatusLoggedOut, "WhatsApp rejected this client version as outdated")
+			logger.Errorf("Client outdated - the bridge needs to be updated (whatsmeow dependency) before it can reconnect")
+
+		case *events.TemporaryBan:
+			connState.Set(StatusBanned, v.String())
+			logger.Errorf("Temporary ban from WhatsApp: %s", v.String())
 
 		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+			reason := "logged out remotely"
+			if v.OnConnect {
+				reason = v.Reason.String()
+			}
+			connState.Set(StatusLoggedOut, reason)
+			logger.Warnf("Device logged out (%s), please scan QR code to log in again", reason)
 		}
 	})
 
@@ -899,11 +1128,19 @@ func main() {
 	time.Sleep(2 * time.Second)
 
 	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
+		// Don't exit the process here: whatsmeow's built-in auto-reconnect (and our
+		// watchdog below) will keep retrying in the background, and the REST API
+		// needs to stay up so callers get a clear "reconnecting" status instead of
+		// a connection-refused error while that happens.
+		connState.Set(StatusReconnecting, "initial connection did not stabilize")
+		logger.Warnf("Connection did not stabilize yet; will keep retrying in the background")
+	} else {
+		connState.Set(StatusConnected, "")
+		fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 	}
 
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+	// Safety-net watchdog on top of whatsmeow's built-in auto-reconnect.
+	go watchReconnection(client, logger)
 
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
